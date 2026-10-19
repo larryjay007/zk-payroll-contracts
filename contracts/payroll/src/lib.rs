@@ -126,6 +126,12 @@ pub use payroll_variance::{
     PayrollVarianceCheck, PayrollVarianceConfig, PayrollVarianceIssue, MAX_VARIANCE_BPS,
 };
 
+/// Treasury balance reservation checks (#699).
+pub mod treasury_reservation;
+pub use treasury_reservation::{
+    check_reservation, unreserved_balance, ReservationIssue, ReservationOutcome,
+};
+
 /// Multi-batch execution progress tracking (#643).
 pub mod multi_batch_progress;
 pub use multi_batch_progress::{
@@ -1580,6 +1586,35 @@ pub struct ComplianceEvidencePointer {
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl Payroll {
+    /// Refuse to lock more treasury funds than are unreserved (#699).
+    ///
+    /// `prepare_payroll_run` locks a run's total so withdrawals cannot spend
+    /// it. The lock is only meaningful if the treasury can cover it, so this
+    /// applies the rule `check_funding_source_readiness` uses for a
+    /// hypothetical spend (`amount <= treasury balance - locked funds`) to the
+    /// real reservation, and fails with the figures behind the decision.
+    fn require_reservable_treasury_balance(e: &Env, addrs: &ContractAddresses, amount: i128) {
+        let total_balance =
+            match soroban_token::Client::new(e, &addrs.token).try_balance(&addrs.treasury) {
+                Ok(Ok(balance)) => balance,
+                _ => panic!(
+                    "Treasury token unavailable: cannot confirm the balance to reserve against"
+                ),
+            };
+        let reserved = Self::get_locked_funds(e.clone(), addrs.token.clone());
+
+        match treasury_reservation::check_reservation(total_balance, reserved, amount) {
+            Ok(_) => {}
+            Err(ReservationIssue::NonPositiveAmount) => {
+                panic!("Reservation amount must be positive")
+            }
+            Err(ReservationIssue::InsufficientUnreserved { available }) => panic!(
+                "Insufficient available treasury balance: run needs {} but only {} is unreserved ({} of {} is locked for pending payroll); fund the treasury or cancel a pending run",
+                amount, available, reserved, total_balance
+            ),
+        }
+    }
+
     /// Publish the same aggregate treasury view exposed by the read-only API.
     /// No employee rows, salary values, or proof material are included.
     fn emit_treasury_balance_snapshot(e: &Env, asset: Address, trigger: Symbol) {
@@ -3932,6 +3967,9 @@ impl Payroll {
         if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
             panic!("Asset not allowed");
         }
+
+        // Issue #699: the funds this run will lock must be unreserved in the treasury.
+        Self::require_reservable_treasury_balance(&e, &addrs, expected_total_spend);
 
         // Issue #338: enforce per-period capacity limits before the batch is locked in.
         Self::enforce_and_record_capacity(&e, count, expected_total_spend);

@@ -81,6 +81,7 @@ where the contract exposes `Result<_, Error>`.
 | `payroll.record_multi_batch_progress` | `"Multi-batch progress regression: new progress is behind stored progress"` | A cursor moved backwards (#643). | Non-retryable until corrected | Resubmit with cursors at or ahead of the stored values. |
 | `payroll.record_multi_batch_progress` | `"Multi-batch progress must move forward: no new batches or payments recorded"` | Identical resubmission with no new work (#643). | Non-retryable until corrected | Advance at least one cursor. |
 | `payroll.record_multi_batch_progress`, `mark_multi_batch_failed` | `"Multi-batch execution is already terminal"` | The execution is `Completed` or `Failed` (#643). | Non-retryable for this id | Start a new execution with a fresh `execution_id`; terminal records are immutable. |
+| `payroll.transfer_pending_run_admin` | `"Delegation limit reached: this run has already been handed over 100 times; finalize or cancel it instead of transferring again"` | The run's delegation audit trail is full (#714). | Non-retryable for this run | Finalize or cancel the run; audit it with `verify_run_delegation_audit`. See [Payroll Responsibility Delegation Audit](./run-delegation-audit.md). |
 
 ## Treasury and Token Checks
 

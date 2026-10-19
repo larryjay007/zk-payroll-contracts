@@ -170,6 +170,14 @@ pub use treasury_replenishment_analysis::{
     TreasuryAnalysisError, TreasuryReplenishmentConfig,
 };
 
+/// Payroll responsibility delegation audit (#714).
+pub mod delegation_audit;
+pub use delegation_audit::{
+    check_can_record, clamp_page_size, verify_records, DelegationAuditIssue, DelegationAuditKey,
+    DelegationAuditVerdict, DelegationIssue, DelegationRecord, MAX_DELEGATIONS_PER_RUN,
+    MAX_DELEGATION_AUDIT_PAGE,
+};
+
 const MAX_BATCH: u32 = 50;
 const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
@@ -4061,6 +4069,10 @@ impl Payroll {
             panic!("Invalid transfer: new admin is the same as current admin");
         }
 
+        // Issue #714: record the handover before it takes effect; this panics
+        // when the run's delegation trail is full.
+        let record = delegation_audit::append(&e, run_id, &current_admin, &new_admin);
+
         pending_run.admin = new_admin.clone();
 
         e.storage().persistent().set(&pending_key, &pending_run);
@@ -4072,6 +4084,78 @@ impl Payroll {
             ),
             (run_id, current_admin, new_admin),
         );
+        e.events().publish(
+            (
+                Symbol::new(&e, "payroll"),
+                Symbol::new(&e, "delegation_recorded"),
+            ),
+            (
+                run_id,
+                record.sequence,
+                record.delegator,
+                record.delegate,
+                record.delegated_at,
+            ),
+        );
+    }
+
+    // ── Issue #714: Payroll responsibility delegation audit ─────────────────
+
+    /// Number of times responsibility for `run_id` has been handed over.
+    ///
+    /// Read-only; `0` for a run that was never handed over, including a run
+    /// that no longer exists.
+    pub fn get_run_delegation_count(e: Env, run_id: u64) -> u32 {
+        delegation_audit::count(&e, run_id)
+    }
+
+    /// The handover with the 1-based `sequence` for `run_id`, if recorded.
+    pub fn get_run_delegation(e: Env, run_id: u64, sequence: u32) -> Option<DelegationRecord> {
+        delegation_audit::entry(&e, run_id, sequence)
+    }
+
+    /// A page of the run's handovers, oldest first.
+    ///
+    /// Returns the records whose sequence is greater than `after_sequence`
+    /// (pass `0` for the first page, then the last sequence you received),
+    /// at most `limit` of them and never more than
+    /// `MAX_DELEGATION_AUDIT_PAGE`.
+    pub fn get_run_delegation_audit(
+        e: Env,
+        run_id: u64,
+        after_sequence: u32,
+        limit: u32,
+    ) -> Vec<DelegationRecord> {
+        delegation_audit::page(&e, run_id, after_sequence, limit)
+    }
+
+    /// Check that the run's delegation trail still adds up.
+    ///
+    /// Records must be numbered 1, 2, 3... without gaps, each handover must
+    /// start from the previous one's delegate, and, while the run is pending,
+    /// the last delegate must be the run's current admin. The verdict names
+    /// the first problem and the sequence it was found at.
+    pub fn verify_run_delegation_audit(e: Env, run_id: u64) -> DelegationAuditVerdict {
+        let records = delegation_audit::all(&e, run_id);
+        let pending: Option<PendingPayrollRun> =
+            e.storage().persistent().get(&DataKey::PendingRun(run_id));
+        let current_admin = pending.as_ref().map(|run| run.admin.clone());
+
+        let (issue, issue_at) = delegation_audit::verify_records(&records, current_admin.as_ref());
+        let current_holder = match &current_admin {
+            Some(admin) => Some(admin.clone()),
+            None => records.last().map(|record| record.delegate),
+        };
+
+        DelegationAuditVerdict {
+            run_id,
+            entries: delegation_audit::count(&e, run_id),
+            consistent: issue == DelegationAuditIssue::NoIssue,
+            issue,
+            issue_at,
+            run_pending: pending.is_some(),
+            current_holder,
+        }
     }
 
     /// Get a pending payroll run, if it exists.
